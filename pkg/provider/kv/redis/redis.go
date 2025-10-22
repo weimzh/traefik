@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/kvtools/redis"
+	goredis "github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/provider"
 	"github.com/traefik/traefik/v3/pkg/provider/kv"
 	"github.com/traefik/traefik/v3/pkg/types"
@@ -22,6 +25,9 @@ type Provider struct {
 	Password string           `description:"Password for authentication." json:"password,omitempty" toml:"password,omitempty" yaml:"password,omitempty" loggable:"false"`
 	DB       int              `description:"Database to be selected after connecting to the server." json:"db,omitempty" toml:"db,omitempty" yaml:"db,omitempty"`
 	Sentinel *Sentinel        `description:"Enable Sentinel support." json:"sentinel,omitempty" toml:"sentinel,omitempty" yaml:"sentinel,omitempty" export:"true"`
+
+	// Direct Redis client for keyspace notifications
+	redisClient goredis.UniversalClient
 }
 
 // Sentinel holds the Redis Sentinel configuration.
@@ -78,7 +84,130 @@ func (p *Provider) Init() error {
 			ReplicaOnly:             p.Sentinel.ReplicaStrategy,
 			UseDisconnectedReplicas: p.Sentinel.UseDisconnectedReplicas,
 		}
+
+		// Create Sentinel client for keyspace notifications
+		p.redisClient = goredis.NewFailoverClient(&goredis.FailoverOptions{
+			MasterName:       p.Sentinel.MasterName,
+			SentinelAddrs:    p.Endpoints,
+			SentinelUsername: p.Sentinel.Username,
+			SentinelPassword: p.Sentinel.Password,
+			Username:         p.Username,
+			Password:         p.Password,
+			DB:               p.DB,
+			TLSConfig:        config.TLS,
+		})
+	} else {
+		// Create standard Redis client for keyspace notifications
+		if len(p.Endpoints) == 0 {
+			p.Endpoints = []string{"127.0.0.1:6379"}
+		}
+
+		p.redisClient = goredis.NewClient(&goredis.Options{
+			Addr:      p.Endpoints[0],
+			Username:  p.Username,
+			Password:  p.Password,
+			DB:        p.DB,
+			TLSConfig: config.TLS,
+		})
 	}
 
+	// Test the direct Redis connection
+	ctx := context.Background()
+	if err := p.redisClient.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("failed to connect to Redis for keyspace notifications: %w", err)
+	}
+
+	// Set the outer provider reference so kv.Provider can detect GranularWatcher implementation
+	p.Provider.SetOuterProvider(p)
+
 	return p.Provider.Init(redis.StoreName, "redis", config)
+}
+
+// WatchKeys watches for specific key changes using Redis keyspace notifications.
+// This implements the kv.GranularWatcher interface for incremental updates.
+func (p *Provider) WatchKeys(ctx context.Context, prefix string) (<-chan kv.KeyChangeEvent, error) {
+	events := make(chan kv.KeyChangeEvent, 100)
+
+	// Subscribe to keyspace notifications for the prefix
+	// Pattern: __keyspace@{db}__:{prefix}*
+	pattern := fmt.Sprintf("__keyspace@%d__:%s*", p.DB, prefix)
+
+	logger := log.Ctx(ctx).With().
+		Str("pattern", pattern).
+		Int("db", p.DB).
+		Logger()
+
+	logger.Info().Msg("Subscribing to Redis keyspace notifications")
+
+	pubsub := p.redisClient.PSubscribe(ctx, pattern)
+
+	go func() {
+		defer close(events)
+		defer func() {
+			if err := pubsub.Close(); err != nil {
+				logger.Error().Err(err).Msg("Error closing pubsub")
+			}
+		}()
+
+		ch := pubsub.Channel()
+		logger.Info().Msg("Listening for Redis keyspace events")
+
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info().Msg("Stopping Redis keyspace watch")
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					logger.Warn().Msg("Redis pubsub channel closed")
+					return
+				}
+
+				// Parse keyspace notification
+				// Channel format: __keyspace@{db}__:{key}
+				// Message: "set", "del", "expire", "expired", etc.
+				key := extractKeyFromChannel(msg.Channel, p.DB)
+				operation := msg.Payload
+
+				eventLogger := logger.With().
+					Str("key", key).
+					Str("operation", operation).
+					Logger()
+
+				var value []byte
+				if operation == "set" || operation == "hset" {
+					// Fetch the new value for set operations
+					val, err := p.redisClient.Get(ctx, key).Result()
+					if err != nil {
+						if err != goredis.Nil {
+							eventLogger.Error().Err(err).Msg("Failed to get key value")
+						}
+						continue
+					}
+					value = []byte(val)
+				}
+
+				eventLogger.Debug().Msg("Received keyspace event")
+
+				select {
+				case events <- kv.KeyChangeEvent{
+					Key:       key,
+					Operation: operation,
+					Value:     value,
+				}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return events, nil
+}
+
+// extractKeyFromChannel extracts the key name from a Redis keyspace notification channel.
+// Channel format: __keyspace@{db}__:{key}
+func extractKeyFromChannel(channel string, db int) string {
+	prefix := fmt.Sprintf("__keyspace@%d__:", db)
+	return strings.TrimPrefix(channel, prefix)
 }
