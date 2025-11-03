@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kvtools/redis"
 	goredis "github.com/redis/go-redis/v9"
@@ -111,10 +112,43 @@ func (p *Provider) Init() error {
 		})
 	}
 
-	// Test the direct Redis connection
+	// Test the direct Redis connection with retry logic
 	ctx := context.Background()
-	if err := p.redisClient.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("failed to connect to Redis for keyspace notifications: %w", err)
+	maxRetries := 5
+	retryDelay := 2 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := p.redisClient.Ping(ctx).Err(); err != nil {
+			lastErr = err
+			log.Warn().
+				Err(err).
+				Int("attempt", attempt).
+				Int("maxRetries", maxRetries).
+				Dur("retryDelay", retryDelay).
+				Msg("Failed to connect to Redis, retrying...")
+
+			if attempt < maxRetries {
+				time.Sleep(retryDelay)
+			}
+			continue
+		}
+
+		// Connection successful
+		if attempt > 1 {
+			log.Info().
+				Int("attempt", attempt).
+				Msg("Successfully connected to Redis")
+		}
+		lastErr = nil
+		break
+	}
+
+	if lastErr != nil {
+		log.Fatal().
+			Err(lastErr).
+			Int("attempts", maxRetries).
+			Msg("Failed to connect to Redis after multiple attempts, terminating service")
 	}
 
 	// Set the outer provider reference so kv.Provider can detect GranularWatcher implementation
@@ -149,7 +183,6 @@ func (p *Provider) WatchKeys(ctx context.Context, prefix string) (<-chan kv.KeyC
 			}
 		}()
 
-		ch := pubsub.Channel()
 		logger.Info().Msg("Listening for Redis keyspace events")
 
 		for {
@@ -157,46 +190,100 @@ func (p *Provider) WatchKeys(ctx context.Context, prefix string) (<-chan kv.KeyC
 			case <-ctx.Done():
 				logger.Info().Msg("Stopping Redis keyspace watch")
 				return
-			case msg, ok := <-ch:
-				if !ok {
-					logger.Warn().Msg("Redis pubsub channel closed")
-					return
-				}
-
-				// Parse keyspace notification
-				// Channel format: __keyspace@{db}__:{key}
-				// Message: "set", "del", "expire", "expired", etc.
-				key := extractKeyFromChannel(msg.Channel, p.DB)
-				operation := msg.Payload
-
-				eventLogger := logger.With().
-					Str("key", key).
-					Str("operation", operation).
-					Logger()
-
-				var value []byte
-				if operation == "set" || operation == "hset" {
-					// Fetch the new value for set operations
-					val, err := p.redisClient.Get(ctx, key).Result()
-					if err != nil {
-						if err != goredis.Nil {
-							eventLogger.Error().Err(err).Msg("Failed to get key value")
-						}
-						continue
+			default:
+				// Use Receive() to get messages and detect reconnection errors
+				msg, err := pubsub.Receive(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						// Context cancelled, exit gracefully
+						logger.Info().Msg("Context cancelled, stopping Redis watch")
+						return
 					}
-					value = []byte(val)
+
+					// Connection error or reconnection happened
+					logger.Warn().Err(err).Msg("Redis pubsub receive error, connection lost or reconnecting")
+
+					// Send reconnect event to trigger full configuration reload
+					select {
+					case events <- kv.KeyChangeEvent{
+						Key:       prefix,
+						Operation: "reconnect",
+						Value:     nil,
+					}:
+					case <-ctx.Done():
+						return
+					}
+
+					// Wait a bit before continuing to allow reconnection
+					time.Sleep(1 * time.Second)
+					continue
 				}
 
-				eventLogger.Debug().Msg("Received keyspace event")
+				// Process the received message
+				switch v := msg.(type) {
+				case *goredis.Subscription:
+					// Subscription confirmation
+					logger.Info().
+						Str("kind", v.Kind).
+						Str("channel", v.Channel).
+						Int("count", v.Count).
+						Msg("Redis subscription event")
 
-				select {
-				case events <- kv.KeyChangeEvent{
-					Key:       key,
-					Operation: operation,
-					Value:     value,
-				}:
-				case <-ctx.Done():
-					return
+					// If this is a subscription after initial setup, it means we reconnected
+					if v.Kind == "psubscribe" && v.Count > 0 {
+						logger.Info().Msg("Resubscribed after reconnection, triggering full configuration reload")
+						select {
+						case events <- kv.KeyChangeEvent{
+							Key:       prefix,
+							Operation: "reconnect",
+							Value:     nil,
+						}:
+						case <-ctx.Done():
+							return
+						}
+					}
+
+				case *goredis.Message:
+					// Regular keyspace notification
+					// Parse keyspace notification
+					// Channel format: __keyspace@{db}__:{key}
+					// Message: "set", "del", "expire", "expired", etc.
+					key := extractKeyFromChannel(v.Channel, p.DB)
+					operation := v.Payload
+
+					eventLogger := logger.With().
+						Str("key", key).
+						Str("operation", operation).
+						Logger()
+
+					var value []byte
+					if operation == "set" || operation == "hset" {
+						// Fetch the new value for set operations
+						val, err := p.redisClient.Get(ctx, key).Result()
+						if err != nil {
+							if err != goredis.Nil {
+								eventLogger.Error().Err(err).Msg("Failed to get key value")
+							}
+							continue
+						}
+						value = []byte(val)
+					}
+
+					eventLogger.Debug().Msg("Received keyspace event")
+
+					select {
+					case events <- kv.KeyChangeEvent{
+						Key:       key,
+						Operation: operation,
+						Value:     value,
+					}:
+					case <-ctx.Done():
+						return
+					}
+
+				case *goredis.Pong:
+					// Pong response, ignore
+					logger.Debug().Msg("Received pong")
 				}
 			}
 		}

@@ -46,15 +46,25 @@ type Provider struct {
 	mu            sync.RWMutex
 	currentConfig *dynamic.Configuration
 	kvPairs       map[string]string
-	lastFullScan  time.Time
 
 	// Reference to the outer provider that may implement GranularWatcher
 	outerProvider interface{}
+
+	// Rate limiting for configuration updates
+	updateTimer      *time.Timer
+	pendingUpdate    bool
+	lastUpdateTime   time.Time
+	minUpdateDelay   time.Duration
+	maxUpdateDelay   time.Duration
+	updateMu         sync.Mutex
 }
 
 // SetDefaults sets the default values.
 func (p *Provider) SetDefaults() {
 	p.RootKey = "traefik"
+	// Default rate limiting: debounce for 300ms, but force update after max 1 second
+	p.minUpdateDelay = 300 * time.Millisecond
+	p.maxUpdateDelay = 1 * time.Second
 }
 
 // SetOuterProvider sets the reference to the outer provider that may implement GranularWatcher.
@@ -190,10 +200,20 @@ func (p *Provider) watchKvGranular(ctx context.Context, configurationChan chan<-
 				p.kvPairs[pair.Key] = string(pair.Value)
 			}
 		}
-		p.lastFullScan = time.Now()
 		log.Ctx(ctx).Info().Int("keys", len(p.kvPairs)).Msg("Initial state loaded")
 	}
 	p.mu.Unlock()
+
+	// Channel for triggering rate-limited configuration updates
+	triggerUpdate := make(chan struct{}, 1)
+
+	// Goroutine to handle rate-limited configuration updates
+	pool := &sync.WaitGroup{}
+	pool.Add(1)
+	go func() {
+		defer pool.Done()
+		p.handleRateLimitedUpdates(ctx, configurationChan, triggerUpdate)
+	}()
 
 	operation := func() error {
 		// Subscribe to key changes
@@ -205,37 +225,36 @@ func (p *Provider) watchKvGranular(ctx context.Context, configurationChan chan<-
 		for {
 			select {
 			case <-ctx.Done():
+				// Wait for pending updates to complete
+				pool.Wait()
 				return nil
 
 			case event, ok := <-events:
 				if !ok {
+					// Wait for pending updates to complete
+					pool.Wait()
 					return errors.New("watch channel closed")
 				}
 
-				// Check if 10 minutes have passed since last full scan
-				p.mu.RLock()
-				timeSinceLastScan := time.Since(p.lastFullScan)
-				p.mu.RUnlock()
-
-				var configuration *dynamic.Configuration
-
-				if timeSinceLastScan >= 10*time.Minute {
-					// Perform full scan (event-triggered periodic scan)
-					log.Ctx(ctx).Info().
-						Str("timeSinceLastScan", timeSinceLastScan.String()).
-						Msg("Performing event-triggered full scan")
-					configuration = p.performFullScan(ctx, events)
-				} else {
-					// Apply incremental change
-					configuration = p.applyKeyChange(ctx, event)
-				}
-
-				if configuration != nil {
-					configurationChan <- dynamic.Message{
-						ProviderName:  p.name,
-						Configuration: configuration,
+				// Check if this is a reconnection event
+				if event.Operation == "reconnect" {
+					// Force full configuration reload after reconnection (bypass rate limiting)
+					log.Ctx(ctx).Info().Msg("Redis reconnection detected, performing full configuration reload")
+					configuration := p.performFullScan(ctx, events)
+					if configuration != nil {
+						configurationChan <- dynamic.Message{
+							ProviderName:  p.name,
+							Configuration: configuration,
+						}
 					}
+					continue
 				}
+
+				// Apply incremental change (updates internal state)
+				p.applyKeyChange(ctx, event)
+
+				// Trigger rate-limited update
+				p.scheduleUpdate(triggerUpdate)
 			}
 		}
 	}
@@ -246,6 +265,155 @@ func (p *Provider) watchKvGranular(ctx context.Context, configurationChan chan<-
 
 	return backoff.RetryNotify(safe.OperationWithRecover(operation),
 		backoff.WithContext(job.NewBackOff(backoff.NewExponentialBackOff()), ctx), notify)
+}
+
+// scheduleUpdate marks that there's a pending update and triggers the rate limiter
+func (p *Provider) scheduleUpdate(triggerUpdate chan<- struct{}) {
+	p.updateMu.Lock()
+	p.pendingUpdate = true
+	p.updateMu.Unlock()
+
+	// Non-blocking trigger send
+	select {
+	case triggerUpdate <- struct{}{}:
+	default:
+		// Already triggered, no need to send again
+	}
+}
+
+// handleRateLimitedUpdates processes configuration updates with rate limiting
+func (p *Provider) handleRateLimitedUpdates(ctx context.Context, configurationChan chan<- dynamic.Message, triggerUpdate <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-triggerUpdate:
+			// We received a trigger, now wait for the appropriate delay
+			p.updateMu.Lock()
+			timeSinceLastUpdate := time.Since(p.lastUpdateTime)
+			firstTrigger := p.lastUpdateTime.IsZero() || timeSinceLastUpdate > p.maxUpdateDelay
+			p.updateMu.Unlock()
+
+			if firstTrigger {
+				// First update or been too long, start fresh timing
+				p.waitAndSendUpdate(ctx, configurationChan, triggerUpdate, time.Now())
+			} else {
+				// Already have a recent update, use debouncing
+				p.waitAndSendUpdate(ctx, configurationChan, triggerUpdate, p.lastUpdateTime)
+			}
+		}
+	}
+}
+
+// waitAndSendUpdate implements the debouncing logic with max delay enforcement
+func (p *Provider) waitAndSendUpdate(ctx context.Context, configurationChan chan<- dynamic.Message, triggerUpdate <-chan struct{}, firstTriggerTime time.Time) {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	// Calculate when we must send an update (max delay from first trigger)
+	maxDeadline := firstTriggerTime.Add(p.maxUpdateDelay)
+
+	// Start with minimum delay
+	timer = time.NewTimer(p.minUpdateDelay)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-triggerUpdate:
+			// Another event arrived, reset the debounce timer
+			// But check if we've exceeded max delay
+			if time.Now().After(maxDeadline) {
+				// Max delay exceeded, send update immediately
+				if !timer.Stop() {
+					<-timer.C
+				}
+				p.sendUpdate(ctx, configurationChan)
+				return
+			}
+
+			// Reset timer for another minimum delay
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(p.minUpdateDelay)
+
+		case <-timer.C:
+			// Timer expired, check if we should send or need to wait more
+			p.updateMu.Lock()
+			hasPending := p.pendingUpdate
+			p.updateMu.Unlock()
+
+			if hasPending {
+				// Check if max delay would be exceeded
+				if time.Until(maxDeadline) <= 0 {
+					// Send immediately
+					p.sendUpdate(ctx, configurationChan)
+					return
+				}
+
+				// Wait for remaining time up to max delay
+				remainingTime := time.Until(maxDeadline)
+				if remainingTime > p.minUpdateDelay {
+					remainingTime = p.minUpdateDelay
+				}
+				timer.Reset(remainingTime)
+			} else {
+				// No pending updates, we're done
+				return
+			}
+		}
+	}
+}
+
+// sendUpdate builds and sends the configuration update
+func (p *Provider) sendUpdate(ctx context.Context, configurationChan chan<- dynamic.Message) {
+	logger := log.Ctx(ctx)
+
+	p.updateMu.Lock()
+	if !p.pendingUpdate {
+		p.updateMu.Unlock()
+		return
+	}
+	p.pendingUpdate = false
+	p.lastUpdateTime = time.Now()
+	p.updateMu.Unlock()
+
+	// Build configuration from current state
+	p.mu.RLock()
+	pairs := make([]*store.KVPair, 0, len(p.kvPairs))
+	for key, value := range p.kvPairs {
+		pairs = append(pairs, &store.KVPair{
+			Key:   key,
+			Value: []byte(value),
+		})
+	}
+	totalKeys := len(p.kvPairs)
+	p.mu.RUnlock()
+
+	cfg := &dynamic.Configuration{}
+	if err := kv.Decode(pairs, cfg, p.RootKey); err != nil {
+		logger.Error().Err(err).Msg("Failed to decode configuration")
+		return
+	}
+
+	p.mu.Lock()
+	p.currentConfig = cfg
+	p.mu.Unlock()
+
+	logger.Info().Int("totalKeys", totalKeys).Msg("Sending rate-limited configuration update")
+
+	configurationChan <- dynamic.Message{
+		ProviderName:  p.name,
+		Configuration: cfg,
+	}
 }
 
 func (p *Provider) performFullScan(ctx context.Context, events <-chan KeyChangeEvent) *dynamic.Configuration {
@@ -298,7 +466,7 @@ func (p *Provider) performFullScan(ctx context.Context, events <-chan KeyChangeE
 			case "set":
 				currentKeys[event.Key] = string(event.Value)
 				drained++
-			case "del", "expire", "expired":
+			case "del", "expired":
 				delete(currentKeys, event.Key)
 				drained++
 			}
@@ -352,7 +520,6 @@ drainComplete:
 
 	// Update internal state
 	p.kvPairs = currentKeys
-	p.lastFullScan = time.Now()
 
 	// Decode configuration
 	cfg := &dynamic.Configuration{}
@@ -365,11 +532,10 @@ drainComplete:
 	return cfg
 }
 
-func (p *Provider) applyKeyChange(ctx context.Context, event KeyChangeEvent) *dynamic.Configuration {
+func (p *Provider) applyKeyChange(ctx context.Context, event KeyChangeEvent) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	changed := false
 	logger := log.Ctx(ctx).With().
 		Str("key", event.Key).
 		Str("operation", event.Operation).
@@ -380,45 +546,20 @@ func (p *Provider) applyKeyChange(ctx context.Context, event KeyChangeEvent) *dy
 		newValue := string(event.Value)
 		if oldValue, exists := p.kvPairs[event.Key]; !exists || oldValue != newValue {
 			p.kvPairs[event.Key] = newValue
-			changed = true
-			logger.Debug().Msg("Key updated")
+			logger.Debug().Msg("Key updated in state")
 		} else {
 			logger.Debug().Msg("Key unchanged, skipping")
 		}
-	case "del", "expire", "expired":
+	case "del", "expired":
 		if _, exists := p.kvPairs[event.Key]; exists {
 			delete(p.kvPairs, event.Key)
-			changed = true
-			logger.Debug().Msg("Key deleted")
+			logger.Debug().Msg("Key deleted from state")
 		} else {
 			logger.Debug().Msg("Key already deleted, skipping")
 		}
 	default:
 		logger.Debug().Msg("Ignoring operation")
 	}
-
-	if !changed {
-		return nil
-	}
-
-	// Rebuild configuration from current state
-	pairs := make([]*store.KVPair, 0, len(p.kvPairs))
-	for key, value := range p.kvPairs {
-		pairs = append(pairs, &store.KVPair{
-			Key:   key,
-			Value: []byte(value),
-		})
-	}
-
-	cfg := &dynamic.Configuration{}
-	if err := kv.Decode(pairs, cfg, p.RootKey); err != nil {
-		logger.Error().Err(err).Msg("Failed to decode configuration")
-		return nil
-	}
-
-	p.currentConfig = cfg
-	logger.Info().Int("totalKeys", len(p.kvPairs)).Msg("Configuration updated")
-	return cfg
 }
 
 func (p *Provider) buildConfiguration(ctx context.Context) (*dynamic.Configuration, error) {
